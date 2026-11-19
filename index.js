@@ -1,5 +1,5 @@
 /**
- * 剧情自动总结 / Auto Summary  v1.2
+ * 剧情自动总结 / Auto Summary  v1.3
  *
  * 每 N 条聊天做一次小总结，每 M 条做一次大总结，并写入当前聊天绑定的世界书，
  * 作为常驻条目辅助后续生成。
@@ -16,6 +16,7 @@ import {
     SYSTEM_PROMPT,
     buildBigPrompt,
     buildSmallPrompt,
+    bigSummaryLimit,
     buildTranscript,
     cleanSummary,
     decideAction,
@@ -379,16 +380,18 @@ function isGenerating() {
     return document.body?.dataset?.generating === 'true';
 }
 
-async function callModel(prompt, kind) {
+async function callModel(prompt, kind, maxChars = 0) {
     const context = getCtx();
     if (typeof context?.generateRaw !== 'function') {
         throw new Error('当前酒馆版本不支持静默生成，请升级到 1.13 以上');
     }
 
+    const bigTokens = Math.max(600, Math.min(4096, Math.round((maxChars || 800) * 1.15)));
+
     const raw = await context.generateRaw({
         prompt,
         systemPrompt: SYSTEM_PROMPT,
-        responseLength: kind === 'big' ? 900 : 500,
+        responseLength: kind === 'big' ? bigTokens : 500,
         trimNames: false,
     });
 
@@ -441,12 +444,13 @@ async function generateForRange(action, { includePrevious = false } = {}) {
     notify('info', action.kind === 'big' ? '正在生成剧情大总结…' : '正在生成剧情小总结…');
 
     const previous = includePrevious && action.kind === 'big' ? await readBigSummary(book) : '';
+    const bigLimit = action.kind === 'big' ? bigSummaryLimit(action.end) : 0;
     const prompt = action.kind === 'big'
-        ? buildBigPrompt({ start: transcriptStart, end: action.end, transcript: transcript.text, previous })
+        ? buildBigPrompt({ start: transcriptStart, end: action.end, transcript: transcript.text, previous, maxChars: bigLimit })
         : buildSmallPrompt({ start: action.start, end: action.end, transcript: transcript.text });
 
-    const raw = await callModel(prompt, action.kind);
-    const content = cleanSummary(raw, action.kind === 'big' ? 1000 : 500);
+    const raw = await callModel(prompt, action.kind, bigLimit);
+    const content = cleanSummary(raw, action.kind === 'big' ? bigLimit : 500);
     if (!content) {
         throw new Error('模型没有返回有效内容');
     }

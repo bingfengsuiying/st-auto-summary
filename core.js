@@ -282,17 +282,35 @@ export function buildSmallPrompt({ start, end, transcript }) {
     ].join('\n');
 }
 
-export function buildBigPrompt({ start, end, transcript, previous = '' }) {
+/** 大总结字数上限：前 100 层 500 字，之后每 100 层 +300 字 */
+export const BIG_BASE_CHARS = 500;
+export const BIG_STEP_CHARS = 300;
+export const BIG_STEP_LAYERS = 100;
+export const BIG_MAX_CHARS = 4000;
+
+/**
+ * 根据大总结覆盖的楼层数计算字数上限。
+ * 1-100 层：500；101-200 层：800；201-300 层：1100；以此类推，最多 4000。
+ * @param {number} coveredLayers
+ * @returns {number}
+ */
+export function bigSummaryLimit(coveredLayers) {
+    const layers = Math.max(0, Math.floor(Number(coveredLayers) || 0));
+    const steps = Math.floor(Math.max(0, layers - 1) / BIG_STEP_LAYERS);
+    return Math.min(BIG_MAX_CHARS, BIG_BASE_CHARS + steps * BIG_STEP_CHARS);
+}
+
+export function buildBigPrompt({ start, end, transcript, previous = '', maxChars = bigSummaryLimit(end) }) {
+    const limit = Math.max(BIG_BASE_CHARS, Math.floor(Number(maxChars) || bigSummaryLimit(end)));
+
     return [
         '请把【已有大总结】和【新增聊天片段】合并成一份新的“剧情大总结”，供后续写作参考。',
         '',
         '要求：',
         '- 使用与聊天相同的语言；',
-        '- 300 字以内，第三人称，只写大概剧情，不写细节；',
-        '- 只概括：主线走向、关键转折、当前局势、主要人物关系、尚未解决的伏笔；',
-        '- 不要逐条罗列事件，不要大段对白，不要心理描写；',
+        `- 字数上限 ${limit} 字：覆盖的楼层越多，上限越高。重要剧情要写清楚（主线、关键转折、人物关系变化、承诺、重要物品与地点、未解决伏笔），次要日常可以压缩；按重要度分配篇幅，不要为凑字数注水，也不要漏掉关键信息；`,
+        '- 不要逐句复述对白，不要大段心理描写，不要评价、不要续写、不要编造未出现的内容；',
         '- 保留已有大总结里仍然重要的信息，删掉已经过时的细节，让整份总结覆盖从第 1 条到当前的全部剧情；',
-        '- 不要评价、不要续写、不要编造未出现的内容；',
         '- 直接输出正文，不要标题、不要列表符号。',
         '',
         '【已有大总结】',

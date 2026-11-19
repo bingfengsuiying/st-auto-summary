@@ -35,7 +35,7 @@
 扩展 → **Install extension** → 填仓库地址：
 
 ```
-https://github.com/你的用户名/st-auto-summary
+https://github.com/bingfengsuiying/st-auto-summary
 ```
 
 刷新页面即可。

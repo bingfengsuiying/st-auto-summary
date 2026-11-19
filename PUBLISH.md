@@ -13,7 +13,7 @@
 ## 2. 推送到 GitHub
 
 ```bash
-git remote add origin https://github.com/你的用户名/st-auto-summary.git
+git remote add origin https://github.com/bingfengsuiying/st-auto-summary.git
 git branch -M main
 git push -u origin main
 git push origin --tags
@@ -32,13 +32,13 @@ GitHub → Releases → Draft a new release，选择该 tag，可把 `st-auto-su
 
 ## 4. 手机拉取
 
-酒馆内：扩展 → Install extension → `https://github.com/你的用户名/st-auto-summary`
+酒馆内：扩展 → Install extension → `https://github.com/bingfengsuiying/st-auto-summary`
 
 Termux：
 
 ```bash
 cd ~/SillyTavern/public/scripts/extensions/third-party
-git clone https://github.com/你的用户名/st-auto-summary.git
+git clone https://github.com/bingfengsuiying/st-auto-summary.git
 # 更新
 cd st-auto-summary && git pull
 ```

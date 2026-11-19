@@ -1,5 +1,5 @@
 /**
- * 剧情自动总结 / Auto Summary  v1.1
+ * 剧情自动总结 / Auto Summary  v1.2
  *
  * 每 N 条聊天做一次小总结，每 M 条做一次大总结，并写入当前聊天绑定的世界书，
  * 作为常驻条目辅助后续生成。
@@ -292,37 +292,77 @@ async function writeSummaryEntry(book, action, content) {
     const settings = getSettings();
     const data = await loadBook(book);
 
-    // 同一范围重复总结（例如清理状态后又手动跑一次）时更新原条目，避免堆重复
-    const duplicate = Object.values(data.entries).find((entry) => {
-        const meta = parseSummaryEntry(entry);
-        return meta && meta.kind === action.kind && meta.start === action.start && meta.end === action.end;
-    });
-
     let uid;
-    if (duplicate) {
-        uid = Number(duplicate.uid);
-        Object.assign(duplicate, makeSummaryEntry({
-            uid,
-            kind: action.kind,
-            start: action.start,
-            end: action.end,
-            content,
-            settings,
-        }));
-    } else {
-        uid = getFreeUid(data.entries);
-        if (uid === null) {
-            throw new Error('世界书条目数量已满');
-        }
 
-        data.entries[uid] = makeSummaryEntry({
-            uid,
-            kind: action.kind,
-            start: action.start,
-            end: action.end,
-            content,
-            settings,
+    if (action.kind === 'big') {
+        // 大总结始终只有一条：更新已有的大总结，让它覆盖第 1 条到当前
+        const target = findLatestSummaryEntry(data, 'big');
+        const entryStart = 0;
+        const entryEnd = Math.max(action.end, target?.meta.end ?? 0);
+
+        if (target) {
+            uid = target.uid;
+            const origin = target.meta.origin === 'manual' ? 'manual' : 'auto';
+            Object.assign(target.entry, makeSummaryEntry({
+                uid,
+                kind: 'big',
+                start: entryStart,
+                end: entryEnd,
+                content,
+                settings,
+                origin,
+            }));
+        } else {
+            uid = getFreeUid(data.entries);
+            if (uid === null) {
+                throw new Error('世界书条目数量已满');
+            }
+            data.entries[uid] = makeSummaryEntry({
+                uid,
+                kind: 'big',
+                start: entryStart,
+                end: entryEnd,
+                content,
+                settings,
+                origin: 'auto',
+            });
+        }
+    } else {
+        // 小总结：同一范围重复总结时更新原条目，避免堆重复
+        // 只更新同范围的“自动”小总结；手动条目保持原样，不让自动流程改写
+        const duplicate = Object.values(data.entries).find((entry) => {
+            const meta = parseSummaryEntry(entry);
+            return meta && meta.kind === 'small' && meta.origin === 'auto'
+                && meta.start === action.start && meta.end === action.end;
         });
+
+        if (duplicate) {
+            uid = Number(duplicate.uid);
+            Object.assign(duplicate, makeSummaryEntry({
+                uid,
+                kind: 'small',
+                start: action.start,
+                end: action.end,
+                content,
+                settings,
+                origin: 'auto',
+            }));
+        } else {
+            uid = getFreeUid(data.entries);
+            if (uid === null) {
+                throw new Error('世界书条目数量已满');
+            }
+
+            data.entries[uid] = makeSummaryEntry({
+                uid,
+                kind: 'small',
+                start: action.start,
+                end: action.end,
+                content,
+                settings,
+                origin: 'auto',
+            });
+        }
     }
 
     pruneSummaryEntries(data, settings.keepSmall, { keepBigUid: action.kind === 'big' ? uid : null, protectUids: [uid] });
@@ -379,7 +419,17 @@ async function generateForRange(action, { includePrevious = false } = {}) {
     const settings = getSettings();
     const book = await resolveBook();
 
-    const transcript = buildTranscript(context.chat, action.start, action.end, {
+    // 大总结必须覆盖全部剧情：从上次大总结的进度开始补，而不是只看用户选的起点
+    let transcriptStart = action.start;
+    if (action.kind === 'big') {
+        const lastBig = Math.min(getState().lastBigAt, action.end);
+        transcriptStart = lastBig;
+        if (action.end - transcriptStart <= 0) {
+            transcriptStart = Math.max(0, action.end - (settings.bigEvery || 100));
+        }
+    }
+
+    const transcript = buildTranscript(context.chat, transcriptStart, action.end, {
         maxChars: settings.maxInputChars,
         defaultName: getEntityName(),
     });
@@ -392,7 +442,7 @@ async function generateForRange(action, { includePrevious = false } = {}) {
 
     const previous = includePrevious && action.kind === 'big' ? await readBigSummary(book) : '';
     const prompt = action.kind === 'big'
-        ? buildBigPrompt({ start: action.start, end: action.end, transcript: transcript.text, previous })
+        ? buildBigPrompt({ start: transcriptStart, end: action.end, transcript: transcript.text, previous })
         : buildSmallPrompt({ start: action.start, end: action.end, transcript: transcript.text });
 
     const raw = await callModel(prompt, action.kind);
@@ -472,16 +522,31 @@ function waitForPopupElement(selector, callback, attempts = 15) {
  */
 async function openRangeDialog(kind, total) {
     const context = getCtx();
-    const suggested = manualRange(kind, total, getState());
-    const defaultStart = Math.min(total, (suggested ? suggested.start : total - 1) + 1);
-    const defaultEnd = total;
+    const isBig = kind === 'big';
+    const state = getState();
+    const lastBig = Math.min(state.lastBigAt, total);
+    const bigMinEnd = Math.min(total, lastBig + 1);
+    const suggested = manualRange(kind, total, state);
+    const defaultStart = isBig ? 1 : Math.min(total, (suggested ? suggested.start : total - 1) + 1);
+    const defaultEnd = isBig ? Math.max(total, bigMinEnd) : total;
     const draft = { start: defaultStart, end: defaultEnd };
 
     if (!context?.callGenericPopup || !context?.POPUP_TYPE) {
-        return { kind, start: defaultStart - 1, end: defaultEnd };
+        return { kind, start: isBig ? 0 : defaultStart - 1, end: defaultEnd };
     }
 
-    const html = `
+    const html = isBig
+        ? `
+        <div class="as-dialog">
+            <div class="as-dialog-info">共 ${total} 条消息。大总结只写大概剧情，会吞并旧大总结，覆盖第 1 层到结束楼层。</div>
+            <div class="as-dialog-row">
+                <label>结束楼层
+                    <input type="number" id="as_range_end" class="text_pole as-num" min="${bigMinEnd}" max="${total}" step="1" inputmode="numeric" value="${defaultEnd}">
+                </label>
+            </div>
+            <div class="as-dialog-preview" id="as_range_preview">将累计总结第 1-${defaultEnd} 条</div>
+        </div>`
+        : `
         <div class="as-dialog">
             <div class="as-dialog-info">共 ${total} 条消息，选择要总结的楼层（从 1 开始，含首尾）。</div>
             <div class="as-dialog-row">
@@ -501,7 +566,8 @@ async function openRangeDialog(kind, total) {
         wide: true,
     });
 
-    waitForPopupElement('#as_range_start', (startEl) => {
+    waitForPopupElement(isBig ? '#as_range_end' : '#as_range_start', () => {
+        const startEl = document.getElementById('as_range_start');
         const endEl = document.getElementById('as_range_end');
         const preview = document.getElementById('as_range_preview');
         if (!endEl) {
@@ -509,20 +575,32 @@ async function openRangeDialog(kind, total) {
         }
 
         const update = () => {
-            draft.start = Number(startEl.value);
             draft.end = Number(endEl.value);
-            const valid = Number.isInteger(draft.start) && Number.isInteger(draft.end)
-                && draft.start >= 1 && draft.end <= total && draft.start <= draft.end;
+            if (startEl) {
+                draft.start = Number(startEl.value);
+            }
+
+            const valid = isBig
+                ? Number.isInteger(draft.end) && draft.end >= bigMinEnd && draft.end <= total
+                : Number.isInteger(draft.start) && Number.isInteger(draft.end)
+                    && draft.start >= 1 && draft.end <= total && draft.start <= draft.end;
 
             if (preview) {
-                preview.textContent = valid
-                    ? `将总结第 ${draft.start}-${draft.end} 条，共 ${draft.end - draft.start + 1} 条`
-                    : `请输入 1-${total} 之间的有效范围`;
+                if (isBig) {
+                    const from = lastBig > 0 ? lastBig + 1 : 1;
+                    preview.textContent = valid
+                        ? `将累计总结第 1-${draft.end} 条（本次从第 ${from} 条开始补）`
+                        : `结束楼层不能早于 ${bigMinEnd}`;
+                } else {
+                    preview.textContent = valid
+                        ? `将总结第 ${draft.start}-${draft.end} 条，共 ${draft.end - draft.start + 1} 条`
+                        : `请输入 1-${total} 之间的有效范围`;
+                }
                 preview.classList.toggle('as-invalid', !valid);
             }
         };
 
-        startEl.addEventListener('input', update);
+        startEl?.addEventListener('input', update);
         endEl.addEventListener('input', update);
         update();
     });
@@ -533,15 +611,17 @@ async function openRangeDialog(kind, total) {
     }
 
     const { start, end } = draft;
-    const valid = Number.isInteger(start) && Number.isInteger(end)
-        && start >= 1 && end <= total && start <= end;
+    const valid = isBig
+        ? Number.isInteger(end) && end >= bigMinEnd && end <= total
+        : Number.isInteger(start) && Number.isInteger(end)
+            && start >= 1 && end <= total && start <= end;
 
     if (!valid) {
-        notify('error', `范围不合法，请输入 1-${total} 之间的楼层`);
+        notify('error', isBig ? `结束楼层不能早于 ${bigMinEnd}` : `范围不合法，请输入 1-${total} 之间的楼层`);
         return null;
     }
 
-    return { kind, start: start - 1, end };
+    return { kind, start: isBig ? 0 : start - 1, end };
 }
 
 /**
@@ -554,11 +634,16 @@ async function openResultDialog(generated) {
     const target = findLatestSummaryEntry(await loadBook(generated.book), generated.action.kind);
     const draft = { text: generated.content };
 
+    const isBig = generated.action.kind === 'big';
     const targetLine = target
-        ? `已有同类总结：${target.entry.comment}`
-        : '当前没有同类总结，保存时会新建一条。';
+        ? (isBig
+            ? `已有大总结：${target.entry.comment}（保存后会更新为第 1-${Math.max(target.meta.end, generated.action.end)} 条）`
+            : `已有同类总结：${target.entry.comment}`)
+        : (isBig ? '当前没有大总结，保存后会新建一条。' : '当前没有同类总结，保存时会新建一条。');
     const hintLine = target
-        ? '“替换总结”会用上面的内容覆盖它；“融合总结”会把旧内容和新内容合并成一条。'
+        ? (isBig
+            ? '“替换总结”会用上面的内容覆盖旧大总结（新内容已经把旧大总结合并进来）；“融合总结”会把旧正文也拼进去，可能重复。'
+            : '“替换总结”会用上面的内容覆盖它；“融合总结”会把旧内容和新内容合并成一条。')
         : '“替换总结”和“融合总结”都会新建一条。';
 
     if (!context?.callGenericPopup || !context?.POPUP_TYPE) {
@@ -612,23 +697,27 @@ async function applyManualSummary(generated, decision) {
     const target = findLatestSummaryEntry(data, action.kind);
 
     let uid;
-    let finalStart = action.start;
+    let finalStart = action.kind === 'big' ? 0 : action.start;
     let finalEnd = action.end;
+    const entryOrigin = 'manual';
 
     if (target && decision.mode === 'replace') {
         uid = target.uid;
+        finalStart = action.kind === 'big' ? 0 : action.start;
+        finalEnd = action.end;
         Object.assign(target.entry, makeSummaryEntry({
             uid,
             kind: action.kind,
-            start: action.start,
-            end: action.end,
+            start: finalStart,
+            end: finalEnd,
             content: text,
             settings,
+            origin: entryOrigin,
         }));
     } else if (target && decision.mode === 'merge') {
         uid = target.uid;
         const oldBody = stripSummaryHeader(target.entry.content);
-        finalStart = Math.min(target.meta.start, action.start);
+        finalStart = action.kind === 'big' ? 0 : Math.min(target.meta.start, action.start);
         finalEnd = Math.max(target.meta.end, action.end);
         const merged = oldBody ? `${oldBody}\n\n${text}` : text;
 
@@ -639,6 +728,7 @@ async function applyManualSummary(generated, decision) {
             end: finalEnd,
             content: merged,
             settings,
+            origin: entryOrigin,
         }));
     } else {
         uid = getFreeUid(data.entries);
@@ -648,10 +738,11 @@ async function applyManualSummary(generated, decision) {
         data.entries[uid] = makeSummaryEntry({
             uid,
             kind: action.kind,
-            start: action.start,
-            end: action.end,
+            start: finalStart,
+            end: finalEnd,
             content: text,
             settings,
+            origin: entryOrigin,
         });
     }
 
@@ -695,7 +786,9 @@ async function runManual(kind) {
             return false;
         }
 
-        const generated = await generateForRange(action, { includePrevious: false });
+        // 手动大总结如果是在当前大总结之后再往后补，就把旧大总结一起带上，保证覆盖全部剧情
+        const includePrevious = kind === 'big' && action.end >= getState().lastBigAt;
+        const generated = await generateForRange(action, { includePrevious });
         const decision = await openResultDialog(generated);
 
         if (!decision || decision.mode === 'cancel') {
@@ -800,23 +893,37 @@ function settingsHtml() {
                 <div class="inline-drawer-content">
                     <label class="checkbox_label" for="as_enabled">
                         <input type="checkbox" id="as_enabled">
-                        <span>自动生成剧情总结并写入世界书</span>
+                        <span>自动总结（总开关）</span>
                     </label>
 
+                    <label class="checkbox_label" for="as_auto_small">
+                        <input type="checkbox" id="as_auto_small">
+                        <span>自动小总结（按下面的间隔触发）</span>
+                    </label>
+                    <label class="checkbox_label" for="as_auto_big">
+                        <input type="checkbox" id="as_auto_big">
+                        <span>自动大总结（吞并旧大总结，覆盖全部楼层）</span>
+                    </label>
+
+                    <div class="as-actions">
+                        <div id="as_all_on" class="menu_button">全部开启</div>
+                        <div id="as_all_off" class="menu_button">全部关闭</div>
+                    </div>
+
                     <div class="as-row">
-                        <span>每</span>
+                        <span>小总结间隔</span>
                         <input type="number" id="as_small_every" class="text_pole" min="5" max="500" step="1" inputmode="numeric">
-                        <span>条做一次小总结</span>
+                        <span>层</span>
                     </div>
                     <div class="as-row">
-                        <span>每</span>
+                        <span>大总结间隔</span>
                         <input type="number" id="as_big_every" class="text_pole" min="10" max="2000" step="1" inputmode="numeric">
-                        <span>条做一次大总结</span>
+                        <span>层</span>
                     </div>
                     <div class="as-row">
-                        <span>世界书里保留最近</span>
+                        <span>自动小总结保留</span>
                         <input type="number" id="as_keep_small" class="text_pole" min="0" max="20" step="1" inputmode="numeric">
-                        <span>条小总结</span>
+                        <span>条（手动不删）</span>
                     </div>
 
                     <label class="as-field" for="as_inject_mode">
@@ -844,7 +951,8 @@ function settingsHtml() {
 
                     <small class="as-hint">
                         总结会写进当前聊天绑定的世界书（没有就自动创建并绑定），以“常驻条目”注入提示词，不修改聊天记录。
-                        生成总结会调用当前接口，消耗少量 token；大总结会合并上一份大总结。
+                        自动大总结每 M 层吞并上一份大总结、覆盖第 1 层到当前；自动小总结按你设的间隔触发。
+                        手动总结可以自选楼层，生成后能预览并选择替换/融合/取消；<b>手动生成的总结不会被自动清理</b>。
                     </small>
                 </div>
             </div>
@@ -867,7 +975,14 @@ function menuHtml() {
 
 function updateMenuLabel() {
     const settings = getSettings();
-    $('#as_menu_label').text(settings.enabled ? `剧情总结：开（${settings.smallEvery}/${settings.bigEvery}）` : '剧情总结：关闭');
+    let stateText = '关闭';
+    if (settings.enabled) {
+        const parts = [];
+        if (settings.autoSmallEnabled) parts.push(`小${settings.smallEvery}`);
+        if (settings.autoBigEnabled) parts.push(`大${settings.bigEvery}`);
+        stateText = parts.length ? `开（${parts.join(' / ')}）` : '开（两个都关）';
+    }
+    $('#as_menu_label').text(`剧情总结：${stateText}`);
     $('#as_menu_toggle').toggleClass('as-off', !settings.enabled);
 }
 
@@ -889,14 +1004,21 @@ async function refreshStatus() {
     const nextSmall = milestones.small + (settings.smallEvery || 50);
     const nextBig = milestones.big + (settings.bigEvery || 100);
 
-    const parts = [
-        `共 ${length} 条`,
-        `下次小总结在 ${nextSmall} 条（还差 ${Math.max(0, nextSmall - length)}）`,
-        `下次大总结在 ${nextBig} 条（还差 ${Math.max(0, nextBig - length)}）`,
-    ];
+    const parts = [`共 ${length} 条`];
+    if (settings.enabled && settings.autoSmallEnabled) {
+        parts.push(`下次小总结在 ${nextSmall} 条（还差 ${Math.max(0, nextSmall - length)}）`);
+    }
+    if (settings.enabled && settings.autoBigEnabled) {
+        parts.push(`下次大总结在 ${nextBig} 条（还差 ${Math.max(0, nextBig - length)}）`);
+    }
+
+    const autoText = settings.enabled
+        ? `自动：小总结${settings.autoSmallEnabled ? '开' : '关'} / 大总结${settings.autoBigEnabled ? '开' : '关'}（总开关已开）`
+        : '自动：关闭';
 
     let book = settings.customBook || context?.chatMetadata?.world_info || state.book || '';
-    let smallCount = 0;
+    let smallAuto = 0;
+    let smallManual = 0;
     let bigCount = 0;
 
     if (book) {
@@ -905,14 +1027,22 @@ async function refreshStatus() {
             for (const entry of Object.values(data.entries)) {
                 const meta = parseSummaryEntry(entry);
                 if (!meta) continue;
-                if (meta.kind === 'big') bigCount++; else smallCount++;
+                if (meta.kind === 'big') {
+                    bigCount++;
+                } else if (meta.origin === 'auto') {
+                    smallAuto++;
+                } else {
+                    smallManual++;
+                }
             }
         } catch (error) {
             console.warn(LOG_PREFIX, '读取世界书状态失败', error);
         }
     }
 
-    const bookText = book ? `世界书：《${book}》（小 ${smallCount} / 大 ${bigCount}）` : '世界书：首次总结时自动创建并绑定';
+    const bookText = book
+        ? `世界书：《${book}》（小 自动 ${smallAuto} / 手动 ${smallManual} · 大 ${bigCount}）`
+        : '世界书：首次总结时自动创建并绑定';
 
     let lastText = '';
     if (state.lastAt) {
@@ -920,25 +1050,67 @@ async function refreshStatus() {
         lastText = `上次：${state.lastKind === 'big' ? '大总结' : '小总结'} · ${time}`;
     }
 
-    const text = [parts.join(' · '), bookText, lastText].filter(Boolean).join('\n');
+    const text = [parts.join(' · '), autoText, bookText, lastText].filter(Boolean).join('\n');
     $('#as_status').text(text);
 }
 
 function bindSettingsUi() {
     const settings = getSettings();
 
-    $('#as_enabled').prop('checked', settings.enabled).on('change', function () {
+    const syncToggles = () => {
         const current = getSettings();
-        current.enabled = Boolean(this.checked);
+        $('#as_enabled').prop('checked', current.enabled);
+        $('#as_auto_small').prop('checked', current.autoSmallEnabled);
+        $('#as_auto_big').prop('checked', current.autoBigEnabled);
+    };
+
+    const afterAutoChange = (message) => {
         persistSettings();
         updateMenuLabel();
         refreshStatus();
-
-        if (current.enabled) {
-            notify('info', `剧情自动总结已开启：每 ${current.smallEvery} 条小总结，每 ${current.bigEvery} 条大总结`);
+        if (message) {
+            notify('info', message);
+        }
+        if (getSettings().enabled) {
             scheduleAuto(1200);
         }
+    };
+
+    $('#as_enabled').on('change', function () {
+        const current = getSettings();
+        current.enabled = Boolean(this.checked);
+        afterAutoChange(current.enabled ? '自动总结已开启' : '自动总结已关闭');
     });
+
+    $('#as_auto_small').on('change', function () {
+        const current = getSettings();
+        current.autoSmallEnabled = Boolean(this.checked);
+        afterAutoChange(`自动小总结已${current.autoSmallEnabled ? '开启' : '关闭'}`);
+    });
+
+    $('#as_auto_big').on('change', function () {
+        const current = getSettings();
+        current.autoBigEnabled = Boolean(this.checked);
+        afterAutoChange(`自动大总结已${current.autoBigEnabled ? '开启' : '关闭'}`);
+    });
+
+    $('#as_all_on').on('click', () => {
+        const current = getSettings();
+        current.enabled = true;
+        current.autoSmallEnabled = true;
+        current.autoBigEnabled = true;
+        syncToggles();
+        afterAutoChange(`已全部开启：每 ${current.smallEvery} 层小总结，每 ${current.bigEvery} 层大总结`);
+    });
+
+    $('#as_all_off').on('click', () => {
+        const current = getSettings();
+        current.enabled = false;
+        syncToggles();
+        afterAutoChange('已全部关闭自动总结');
+    });
+
+    syncToggles();
 
     const numberBindings = [
         ['#as_small_every', 'smallEvery'],

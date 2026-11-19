@@ -12,12 +12,17 @@ export const ENTRY_PREFIX = '[自动总结]';
 export const AUTOMATION_ID = 'st-auto-summary';
 
 export const DEFAULT_SETTINGS = {
+    /** 总开关 */
     enabled: false,
+    /** 自动小总结独立开关 */
+    autoSmallEnabled: true,
+    /** 自动大总结独立开关 */
+    autoBigEnabled: true,
     /** 每多少条消息做一次小总结 */
     smallEvery: 50,
     /** 每多少条消息做一次大总结 */
     bigEvery: 100,
-    /** 世界书里最多保留几条小总结 */
+    /** 世界书里最多保留几条“自动”小总结（手动小总结永不自动删除） */
     keepSmall: 3,
     /** depth = 聊天记录末尾；before = 角色定义前 */
     injectMode: 'depth',
@@ -48,6 +53,8 @@ export function normalizeSettings(raw = {}) {
     const settings = { ...DEFAULT_SETTINGS, ...(raw && typeof raw === 'object' ? raw : {}) };
 
     settings.enabled = Boolean(settings.enabled);
+    settings.autoSmallEnabled = settings.autoSmallEnabled !== false;
+    settings.autoBigEnabled = settings.autoBigEnabled !== false;
     settings.smallEvery = clampInt(settings.smallEvery, 5, 500, DEFAULT_SETTINGS.smallEvery);
     settings.bigEvery = clampInt(settings.bigEvery, 10, 2000, DEFAULT_SETTINGS.bigEvery);
     if (settings.bigEvery < settings.smallEvery) {
@@ -90,18 +97,20 @@ export function computeMilestones(length, smallEvery, bigEvery) {
  * @returns {{kind:'small'|'big', start:number, end:number}|null}
  */
 export function decideAction(length, state = {}, settings = DEFAULT_SETTINGS) {
+    const autoSmall = settings.autoSmallEnabled !== false;
+    const autoBig = settings.autoBigEnabled !== false;
     const smallEvery = clampInt(settings.smallEvery, 5, 500, DEFAULT_SETTINGS.smallEvery);
     const bigEvery = Math.max(smallEvery, clampInt(settings.bigEvery, 10, 2000, DEFAULT_SETTINGS.bigEvery));
     const lastSmall = Math.max(0, toInt(state.lastSmallAt, 0));
     const lastBig = Math.max(0, toInt(state.lastBigAt, 0));
     const milestones = computeMilestones(length, smallEvery, bigEvery);
 
-    if (milestones.big >= bigEvery && milestones.big > lastBig) {
+    if (autoBig && milestones.big >= bigEvery && milestones.big > lastBig) {
         return { kind: 'big', start: lastBig, end: milestones.big };
     }
 
     const covered = Math.max(lastSmall, lastBig);
-    if (milestones.small >= smallEvery && milestones.small > covered) {
+    if (autoSmall && milestones.small >= smallEvery && milestones.small > covered) {
         return { kind: 'small', start: covered, end: milestones.small };
     }
 
@@ -275,20 +284,21 @@ export function buildSmallPrompt({ start, end, transcript }) {
 
 export function buildBigPrompt({ start, end, transcript, previous = '' }) {
     return [
-        '请把【已有大总结】和【最近的聊天片段】合并成一份新的“剧情大总结”，供后续写作参考。',
+        '请把【已有大总结】和【新增聊天片段】合并成一份新的“剧情大总结”，供后续写作参考。',
         '',
         '要求：',
         '- 使用与聊天相同的语言；',
-        '- 500 字以内，第三人称；',
-        '- 按时间顺序概括主线：起因、关键转折、当前局势、人物关系与动机、尚未解决的伏笔；',
-        '- 保留已有大总结里仍然重要的信息，删掉已经过时的细节；',
+        '- 300 字以内，第三人称，只写大概剧情，不写细节；',
+        '- 只概括：主线走向、关键转折、当前局势、主要人物关系、尚未解决的伏笔；',
+        '- 不要逐条罗列事件，不要大段对白，不要心理描写；',
+        '- 保留已有大总结里仍然重要的信息，删掉已经过时的细节，让整份总结覆盖从第 1 条到当前的全部剧情；',
         '- 不要评价、不要续写、不要编造未出现的内容；',
         '- 直接输出正文，不要标题、不要列表符号。',
         '',
         '【已有大总结】',
         previous.trim() ? previous.trim() : '（无）',
         '',
-        `【聊天片段（第 ${start + 1}-${end} 条）】`,
+        `【新增聊天片段（第 ${start + 1}-${end} 条）】`,
         transcript,
     ].join('\n');
 }
@@ -340,33 +350,42 @@ export function entryDefaults() {
     };
 }
 
-export function summaryComment(kind, start, end) {
-    return `${ENTRY_PREFIX}[${kind === 'big' ? '大' : '小'}] 第 ${start + 1}-${end} 条`;
+/**
+ * @param {'small'|'big'} kind
+ * @param {number} start
+ * @param {number} end
+ * @param {'auto'|'manual'} [origin]
+ */
+export function summaryComment(kind, start, end, origin = 'auto') {
+    const originLabel = origin === 'manual' ? '手动' : '自动';
+    return `${ENTRY_PREFIX}[${originLabel}${kind === 'big' ? '大' : '小'}] 第 ${start + 1}-${end} 条`;
 }
 
 /**
- * @param {{uid:number, kind:'small'|'big', start:number, end:number, content:string, settings:object}} args
+ * @param {{uid:number, kind:'small'|'big', start:number, end:number, content:string, settings:object, origin?:'auto'|'manual'}} args
  */
-export function makeSummaryEntry({ uid, kind, start, end, content, settings }) {
+export function makeSummaryEntry({ uid, kind, start, end, content, settings, origin = 'auto' }) {
     const isBig = kind === 'big';
     const title = isBig ? '剧情大总结' : '剧情小总结';
     const position = settings.injectMode === 'before' ? 0 : 4;
     const depth = isBig ? settings.bigDepth : settings.smallDepth;
+    const safeOrigin = origin === 'manual' ? 'manual' : 'auto';
 
     return {
         ...entryDefaults(),
         uid,
-        comment: summaryComment(kind, start, end),
+        comment: summaryComment(kind, start, end, safeOrigin),
         content: `【${title} · 第 ${start + 1}-${end} 条】\n${content}`,
         position,
         depth,
         order: isBig ? 90 : 100,
+        autoSummaryOrigin: safeOrigin,
     };
 }
 
 /**
  * @param {object} entry
- * @returns {{kind:'small'|'big', start:number, end:number}|null}
+ * @returns {{kind:'small'|'big', origin:'auto'|'manual', start:number, end:number}|null}
  */
 export function parseSummaryEntry(entry) {
     if (!entry || typeof entry !== 'object') {
@@ -376,16 +395,18 @@ export function parseSummaryEntry(entry) {
         return null;
     }
 
-    const match = entry.comment.match(/\[(大|小)\][^\d]*(\d+)\s*-\s*(\d+)/);
+    const match = entry.comment.match(/\[(自动|手动)?(大|小)\][^\d]*(\d+)\s*-\s*(\d+)/);
     if (!match) {
         return null;
     }
 
     return {
-        kind: match[1] === '大' ? 'big' : 'small',
+        kind: match[2] === '大' ? 'big' : 'small',
+        // 旧版本条目没有“自动/手动”前缀，按手动处理，保证不会被自动清理
+        origin: match[1] === '自动' ? 'auto' : 'manual',
         // 注释里写的是给人看的 1-based 序号，这里还原成 0-based 下标
-        start: Math.max(0, Number(match[2]) - 1),
-        end: Number(match[3]),
+        start: Math.max(0, Number(match[3]) - 1),
+        end: Number(match[4]),
     };
 }
 
@@ -428,11 +449,13 @@ export function findLatestSummaryEntry(data, kind) {
 }
 
 /**
- * 只保留最近 keepSmall 条小总结，以及唯一一条大总结。
- * 直接修改传入的 data.entries，并返回删除的 uid 列表。
+ * 清理总结条目：
+ * - 手动小总结永远不会被自动删除
+ * - “自动”小总结最多保留最近 keepSmall 条
+ * - 大总结始终只保留一条（最新的那条会吞并旧内容）
  *
  * @param {{entries: Record<string, object>}} data
- * @param {number} keepSmall
+ * @param {number} keepSmall 只作用于“自动”小总结
  * @param {{keepBigUid?: number|null, protectUids?: number[]}} [options]
  * @returns {number[]}
  */
@@ -442,7 +465,7 @@ export function pruneSummaryEntries(data, keepSmall, { keepBigUid = null, protec
     }
 
     const removed = [];
-    const smalls = [];
+    const autoSmalls = [];
     const bigs = [];
     const protectedSet = new Set((protectUids ?? []).map((uid) => Number(uid)));
 
@@ -452,16 +475,19 @@ export function pruneSummaryEntries(data, keepSmall, { keepBigUid = null, protec
             continue;
         }
         if (meta.kind === 'small') {
-            smalls.push({ uid: Number(uid), end: meta.end, start: meta.start });
+            // 手动创建的小总结不参与“保留最近 N 条”的清理
+            if (meta.origin === 'auto') {
+                autoSmalls.push({ uid: Number(uid), end: meta.end, start: meta.start });
+            }
         } else {
             bigs.push({ uid: Number(uid), end: meta.end });
         }
     }
 
-    smalls.sort((a, b) => a.end - b.end || a.uid - b.uid);
+    autoSmalls.sort((a, b) => a.end - b.end || a.uid - b.uid);
     const keep = clampInt(keepSmall, 0, 20, 3);
-    const excess = Math.max(0, smalls.length - keep);
-    const removable = smalls.filter((item) => !protectedSet.has(item.uid));
+    const excess = Math.max(0, autoSmalls.length - keep);
+    const removable = autoSmalls.filter((item) => !protectedSet.has(item.uid));
     for (const item of removable.slice(0, excess)) {
         removed.push(item.uid);
     }

@@ -1,5 +1,5 @@
 /**
- * 剧情自动总结 / Auto Summary  v1.0
+ * 剧情自动总结 / Auto Summary  v1.1
  *
  * 每 N 条聊天做一次小总结，每 M 条做一次大总结，并写入当前聊天绑定的世界书，
  * 作为常驻条目辅助后续生成。
@@ -19,6 +19,7 @@ import {
     buildTranscript,
     cleanSummary,
     decideAction,
+    findLatestSummaryEntry,
     getFreeUid,
     hashString,
     isSummaryEntry,
@@ -28,6 +29,7 @@ import {
     parseSummaryEntry,
     pruneSummaryEntries,
     sanitizeBookName,
+    stripSummaryHeader,
 } from './core.js';
 
 const LOG_PREFIX = '[剧情自动总结]';
@@ -323,7 +325,7 @@ async function writeSummaryEntry(book, action, content) {
         });
     }
 
-    pruneSummaryEntries(data, settings.keepSmall, { keepBigUid: action.kind === 'big' ? uid : null });
+    pruneSummaryEntries(data, settings.keepSmall, { keepBigUid: action.kind === 'big' ? uid : null, protectUids: [uid] });
 
     await context?.saveWorldInfo?.(book, data, true);
     context?.updateWorldInfoList?.();
@@ -353,7 +355,57 @@ async function callModel(prompt, kind) {
     return String(raw ?? '');
 }
 
+async function markState(action, endUsed, book) {
+    const state = getState();
+    if (action.kind === 'big') {
+        state.lastBigAt = Math.max(state.lastBigAt, endUsed);
+    } else {
+        state.lastSmallAt = Math.max(state.lastSmallAt, endUsed);
+        state.smallSeq += 1;
+    }
+    state.lastKind = action.kind;
+    state.lastAt = Date.now();
+    state.book = book;
+    await persistMetadata();
+}
+
 /**
+ * 调用模型生成一段总结（不写世界书）。
+ * @param {{kind:'small'|'big', start:number, end:number}} action
+ * @param {{includePrevious?: boolean}} [options]
+ */
+async function generateForRange(action, { includePrevious = false } = {}) {
+    const context = getCtx();
+    const settings = getSettings();
+    const book = await resolveBook();
+
+    const transcript = buildTranscript(context.chat, action.start, action.end, {
+        maxChars: settings.maxInputChars,
+        defaultName: getEntityName(),
+    });
+
+    if (!transcript.text) {
+        throw new Error('这段聊天没有可总结的正文');
+    }
+
+    notify('info', action.kind === 'big' ? '正在生成剧情大总结…' : '正在生成剧情小总结…');
+
+    const previous = includePrevious && action.kind === 'big' ? await readBigSummary(book) : '';
+    const prompt = action.kind === 'big'
+        ? buildBigPrompt({ start: action.start, end: action.end, transcript: transcript.text, previous })
+        : buildSmallPrompt({ start: action.start, end: action.end, transcript: transcript.text });
+
+    const raw = await callModel(prompt, action.kind);
+    const content = cleanSummary(raw, action.kind === 'big' ? 1000 : 500);
+    if (!content) {
+        throw new Error('模型没有返回有效内容');
+    }
+
+    return { book, action, content, transcript };
+}
+
+/**
+ * 自动总结：生成后直接写入世界书。
  * @param {{kind:'small'|'big', start:number, end:number}} action
  */
 async function runSummary(action, { auto = false } = {}) {
@@ -362,55 +414,299 @@ async function runSummary(action, { auto = false } = {}) {
     }
 
     const context = getCtx();
-    const settings = getSettings();
     if (!context || !Array.isArray(context.chat) || context.chat.length === 0) {
         return false;
     }
 
     busy = true;
     try {
-        const book = await resolveBook();
-        const transcript = buildTranscript(context.chat, action.start, action.end, {
-            maxChars: settings.maxInputChars,
-            defaultName: getEntityName(),
-        });
+        const generated = await generateForRange(action, { includePrevious: action.kind === 'big' });
+        await writeSummaryEntry(generated.book, action, generated.content);
 
-        if (!transcript.text) {
-            throw new Error('这段聊天没有可总结的正文');
-        }
-
-        notify('info', action.kind === 'big' ? '正在生成剧情大总结…' : '正在生成剧情小总结…');
-
-        const previous = action.kind === 'big' ? await readBigSummary(book) : '';
-        const prompt = action.kind === 'big'
-            ? buildBigPrompt({ start: action.start, end: action.end, transcript: transcript.text, previous })
-            : buildSmallPrompt({ start: action.start, end: action.end, transcript: transcript.text });
-
-        const raw = await callModel(prompt, action.kind);
-        const content = cleanSummary(raw, action.kind === 'big' ? 1000 : 500);
-        if (!content) {
-            throw new Error('模型没有返回有效内容');
-        }
-
-        await writeSummaryEntry(book, action, content);
-
-        const state = getState();
-        if (action.kind === 'big') {
-            state.lastBigAt = action.end;
-        } else {
-            state.lastSmallAt = action.end;
-            state.smallSeq += 1;
-        }
-        state.lastKind = action.kind;
-        state.lastAt = Date.now();
-        state.book = book;
-        await persistMetadata();
-
+        await markState(action, action.end, generated.book);
         refreshStatus();
-        notify('success', `${action.kind === 'big' ? '大' : '小'}总结完成（第 ${action.start + 1}-${action.end} 条），已写入《${book}》`);
+
+        notify('success', `${action.kind === 'big' ? '大' : '小'}总结完成（第 ${action.start + 1}-${action.end} 条），已写入《${generated.book}》`);
         return true;
     } catch (error) {
         console.error(LOG_PREFIX, '总结失败', error);
+        errorCooldownUntil = Date.now() + 60000;
+        notify('error', `剧情总结失败：${error?.message || error}`);
+        return false;
+    } finally {
+        busy = false;
+    }
+}
+
+/* ------------------------------- 手动总结的弹窗 ------------------------------- */
+
+function escapeHtml(value) {
+    return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function waitForPopupElement(selector, callback, attempts = 15) {
+    let tries = 0;
+    const tick = () => {
+        const element = document.querySelector(selector);
+        if (element) {
+            callback(element);
+            return;
+        }
+        if (tries++ < attempts) {
+            setTimeout(tick, 100);
+        }
+    };
+    tick();
+}
+
+/**
+ * 手动总结第一步：选择楼层范围。
+ * @param {'small'|'big'} kind
+ * @param {number} total
+ * @returns {Promise<{kind:'small'|'big', start:number, end:number}|null>}
+ */
+async function openRangeDialog(kind, total) {
+    const context = getCtx();
+    const suggested = manualRange(kind, total, getState());
+    const defaultStart = Math.min(total, (suggested ? suggested.start : total - 1) + 1);
+    const defaultEnd = total;
+    const draft = { start: defaultStart, end: defaultEnd };
+
+    if (!context?.callGenericPopup || !context?.POPUP_TYPE) {
+        return { kind, start: defaultStart - 1, end: defaultEnd };
+    }
+
+    const html = `
+        <div class="as-dialog">
+            <div class="as-dialog-info">共 ${total} 条消息，选择要总结的楼层（从 1 开始，含首尾）。</div>
+            <div class="as-dialog-row">
+                <label>起始楼层
+                    <input type="number" id="as_range_start" class="text_pole as-num" min="1" max="${total}" step="1" inputmode="numeric" value="${defaultStart}">
+                </label>
+                <label>结束楼层
+                    <input type="number" id="as_range_end" class="text_pole as-num" min="1" max="${total}" step="1" inputmode="numeric" value="${defaultEnd}">
+                </label>
+            </div>
+            <div class="as-dialog-preview" id="as_range_preview">将总结第 ${defaultStart}-${defaultEnd} 条，共 ${defaultEnd - defaultStart + 1} 条</div>
+        </div>`;
+
+    const promise = context.callGenericPopup(html, context.POPUP_TYPE.CONFIRM, '', {
+        okButton: '开始总结',
+        cancelButton: '取消',
+        wide: true,
+    });
+
+    waitForPopupElement('#as_range_start', (startEl) => {
+        const endEl = document.getElementById('as_range_end');
+        const preview = document.getElementById('as_range_preview');
+        if (!endEl) {
+            return;
+        }
+
+        const update = () => {
+            draft.start = Number(startEl.value);
+            draft.end = Number(endEl.value);
+            const valid = Number.isInteger(draft.start) && Number.isInteger(draft.end)
+                && draft.start >= 1 && draft.end <= total && draft.start <= draft.end;
+
+            if (preview) {
+                preview.textContent = valid
+                    ? `将总结第 ${draft.start}-${draft.end} 条，共 ${draft.end - draft.start + 1} 条`
+                    : `请输入 1-${total} 之间的有效范围`;
+                preview.classList.toggle('as-invalid', !valid);
+            }
+        };
+
+        startEl.addEventListener('input', update);
+        endEl.addEventListener('input', update);
+        update();
+    });
+
+    const result = await promise;
+    if (result !== (context.POPUP_RESULT?.AFFIRMATIVE ?? 1)) {
+        return null;
+    }
+
+    const { start, end } = draft;
+    const valid = Number.isInteger(start) && Number.isInteger(end)
+        && start >= 1 && end <= total && start <= end;
+
+    if (!valid) {
+        notify('error', `范围不合法，请输入 1-${total} 之间的楼层`);
+        return null;
+    }
+
+    return { kind, start: start - 1, end };
+}
+
+/**
+ * 手动总结第三步：展示生成内容，选择替换 / 融合 / 取消。
+ * @param {{book:string, action:{kind:'small'|'big', start:number, end:number}, content:string}} generated
+ * @returns {Promise<{mode:'replace'|'merge'|'cancel', text:string}>}
+ */
+async function openResultDialog(generated) {
+    const context = getCtx();
+    const target = findLatestSummaryEntry(await loadBook(generated.book), generated.action.kind);
+    const draft = { text: generated.content };
+
+    const targetLine = target
+        ? `已有同类总结：${target.entry.comment}`
+        : '当前没有同类总结，保存时会新建一条。';
+    const hintLine = target
+        ? '“替换总结”会用上面的内容覆盖它；“融合总结”会把旧内容和新内容合并成一条。'
+        : '“替换总结”和“融合总结”都会新建一条。';
+
+    if (!context?.callGenericPopup || !context?.POPUP_TYPE) {
+        const ok = globalThis.confirm?.(`${targetLine}\n\n${generated.content}`);
+        return ok ? { mode: 'replace', text: generated.content } : { mode: 'cancel', text: generated.content };
+    }
+
+    const html = `
+        <div class="as-dialog">
+            <div class="as-dialog-info">本次范围：第 ${generated.action.start + 1}-${generated.action.end} 条\n${escapeHtml(targetLine)}</div>
+            <textarea id="as_result_text" class="text_pole as-result-text" rows="10" spellcheck="false">${escapeHtml(generated.content)}</textarea>
+            <div class="as-dialog-preview">${escapeHtml(hintLine)}</div>
+        </div>`;
+
+    const customResult = context.POPUP_RESULT?.CUSTOM1 ?? 1001;
+    const affirmative = context.POPUP_RESULT?.AFFIRMATIVE ?? 1;
+
+    const promise = context.callGenericPopup(html, context.POPUP_TYPE.TEXT, '', {
+        okButton: '替换总结',
+        cancelButton: '取消总结',
+        customButtons: [{ text: '融合总结', result: customResult }],
+        wide: true,
+    });
+
+    waitForPopupElement('#as_result_text', (textarea) => {
+        draft.text = textarea.value;
+        textarea.addEventListener('input', () => {
+            draft.text = textarea.value;
+        });
+    });
+
+    const result = await promise;
+    if (result === customResult) {
+        return { mode: 'merge', text: draft.text };
+    }
+    if (result === affirmative) {
+        return { mode: 'replace', text: draft.text };
+    }
+    return { mode: 'cancel', text: draft.text };
+}
+
+/**
+ * 应用手动总结的结果。
+ */
+async function applyManualSummary(generated, decision) {
+    const context = getCtx();
+    const settings = getSettings();
+    const { book, action, content } = generated;
+    const text = String(decision.text ?? '').trim() || content;
+    const data = await loadBook(book);
+    const target = findLatestSummaryEntry(data, action.kind);
+
+    let uid;
+    let finalStart = action.start;
+    let finalEnd = action.end;
+
+    if (target && decision.mode === 'replace') {
+        uid = target.uid;
+        Object.assign(target.entry, makeSummaryEntry({
+            uid,
+            kind: action.kind,
+            start: action.start,
+            end: action.end,
+            content: text,
+            settings,
+        }));
+    } else if (target && decision.mode === 'merge') {
+        uid = target.uid;
+        const oldBody = stripSummaryHeader(target.entry.content);
+        finalStart = Math.min(target.meta.start, action.start);
+        finalEnd = Math.max(target.meta.end, action.end);
+        const merged = oldBody ? `${oldBody}\n\n${text}` : text;
+
+        Object.assign(target.entry, makeSummaryEntry({
+            uid,
+            kind: action.kind,
+            start: finalStart,
+            end: finalEnd,
+            content: merged,
+            settings,
+        }));
+    } else {
+        uid = getFreeUid(data.entries);
+        if (uid === null) {
+            throw new Error('世界书条目数量已满');
+        }
+        data.entries[uid] = makeSummaryEntry({
+            uid,
+            kind: action.kind,
+            start: action.start,
+            end: action.end,
+            content: text,
+            settings,
+        });
+    }
+
+    pruneSummaryEntries(data, settings.keepSmall, { keepBigUid: action.kind === 'big' ? uid : null, protectUids: [uid] });
+
+    await context?.saveWorldInfo?.(book, data, true);
+    context?.updateWorldInfoList?.();
+
+    await markState(action, finalEnd, book);
+    refreshStatus();
+
+    const actionText = decision.mode === 'merge' ? '已融合' : target ? '已替换' : '已保存';
+    notify('success', `${actionText}${action.kind === 'big' ? '大' : '小'}总结（第 ${finalStart + 1}-${finalEnd} 条）→《${book}》`);
+}
+
+async function runManual(kind) {
+    if (busy) {
+        notify('info', '正在总结中，请稍候');
+        return false;
+    }
+    if (isGenerating()) {
+        notify('info', '酒馆正在生成，请稍后再试');
+        return false;
+    }
+
+    const context = getCtx();
+    const total = context?.chat?.length ?? 0;
+    if (!total) {
+        notify('info', '当前没有聊天消息');
+        return false;
+    }
+
+    if (!getSettings().enabled) {
+        notify('info', '提示：自动总结开关是关的，本次只做手动总结');
+    }
+
+    busy = true;
+    try {
+        const action = await openRangeDialog(kind, total);
+        if (!action) {
+            return false;
+        }
+
+        const generated = await generateForRange(action, { includePrevious: false });
+        const decision = await openResultDialog(generated);
+
+        if (!decision || decision.mode === 'cancel') {
+            notify('info', '已取消，本次总结没有写入世界书');
+            return false;
+        }
+
+        await applyManualSummary(generated, decision);
+        return true;
+    } catch (error) {
+        console.error(LOG_PREFIX, '手动总结失败', error);
         errorCooldownUntil = Date.now() + 60000;
         notify('error', `剧情总结失败：${error?.message || error}`);
         return false;
@@ -453,26 +749,6 @@ async function autoTick() {
     }
 
     await runSummary(action, { auto: true });
-}
-
-async function runManual(kind) {
-    const context = getCtx();
-    const settings = getSettings();
-    if (!settings.enabled) {
-        notify('info', '请先打开「自动总结」开关，或直接点按钮也会执行一次');
-    }
-    if (busy) {
-        notify('info', '正在总结中，请稍候');
-        return;
-    }
-
-    const action = manualRange(kind, context?.chat?.length ?? 0, getState());
-    if (!action) {
-        notify('info', '没有新的聊天内容可以总结');
-        return;
-    }
-
-    await runSummary(action, { auto: false });
 }
 
 async function clearSummaries() {

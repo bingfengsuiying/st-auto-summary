@@ -28,7 +28,7 @@ git tag -a v1.0.0 -m "剧情自动总结 v1.0.0"
 git push origin v1.0.0
 ```
 
-GitHub → Releases → Draft a new release，选择该 tag，可把 `st-auto-summary-1.0.0.zip` 作为附件上传。
+GitHub → Releases → Draft a new release，选择该 tag，可把 `st-auto-summary-1.1.0.zip` 作为附件上传。
 
 ## 4. 手机拉取
 

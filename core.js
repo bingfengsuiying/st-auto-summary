@@ -394,15 +394,49 @@ export function isSummaryEntry(entry) {
 }
 
 /**
+ * 去掉条目正文开头的【剧情小/大总结 · 第 x-y 条】标题，只留内容。
+ * @param {string} content
+ */
+export function stripSummaryHeader(content) {
+    return String(content ?? '').replace(/^【剧情(?:大|小)?总结[^\n]*】\n?/, '').trim();
+}
+
+/**
+ * 找到某一类型（小/大）里结束范围最靠后的那条总结。
+ * @param {{entries: Record<string, object>}} data
+ * @param {'small'|'big'} kind
+ * @returns {{uid: number, meta: {kind:'small'|'big', start:number, end:number}, entry: object}|null}
+ */
+export function findLatestSummaryEntry(data, kind) {
+    const entries = data && typeof data === 'object' ? data.entries : null;
+    if (!entries || typeof entries !== 'object') {
+        return null;
+    }
+
+    let best = null;
+    for (const [uid, entry] of Object.entries(entries)) {
+        const meta = parseSummaryEntry(entry);
+        if (!meta || meta.kind !== kind) {
+            continue;
+        }
+        if (!best || meta.end > best.meta.end) {
+            best = { uid: Number(uid), meta, entry };
+        }
+    }
+
+    return best;
+}
+
+/**
  * 只保留最近 keepSmall 条小总结，以及唯一一条大总结。
  * 直接修改传入的 data.entries，并返回删除的 uid 列表。
  *
  * @param {{entries: Record<string, object>}} data
  * @param {number} keepSmall
- * @param {{keepBigUid?: number|null}} [options]
+ * @param {{keepBigUid?: number|null, protectUids?: number[]}} [options]
  * @returns {number[]}
  */
-export function pruneSummaryEntries(data, keepSmall, { keepBigUid = null } = {}) {
+export function pruneSummaryEntries(data, keepSmall, { keepBigUid = null, protectUids = [] } = {}) {
     if (!data || typeof data !== 'object' || !data.entries) {
         return [];
     }
@@ -410,6 +444,7 @@ export function pruneSummaryEntries(data, keepSmall, { keepBigUid = null } = {})
     const removed = [];
     const smalls = [];
     const bigs = [];
+    const protectedSet = new Set((protectUids ?? []).map((uid) => Number(uid)));
 
     for (const [uid, entry] of Object.entries(data.entries)) {
         const meta = parseSummaryEntry(entry);
@@ -425,8 +460,9 @@ export function pruneSummaryEntries(data, keepSmall, { keepBigUid = null } = {})
 
     smalls.sort((a, b) => a.end - b.end || a.uid - b.uid);
     const keep = clampInt(keepSmall, 0, 20, 3);
-    const toRemoveSmall = keep === 0 ? smalls : smalls.slice(0, Math.max(0, smalls.length - keep));
-    for (const item of toRemoveSmall) {
+    const excess = Math.max(0, smalls.length - keep);
+    const removable = smalls.filter((item) => !protectedSet.has(item.uid));
+    for (const item of removable.slice(0, excess)) {
         removed.push(item.uid);
     }
 

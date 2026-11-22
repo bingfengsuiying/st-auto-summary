@@ -1,5 +1,5 @@
 /**
- * 剧情自动总结 / Auto Summary  v1.4
+ * 剧情自动总结 / Auto Summary  v1.5
  *
  * 每 N 条聊天做一次小总结，每 M 条做一次大总结，并写入当前聊天绑定的世界书，
  * 作为常驻条目辅助后续生成。
@@ -26,6 +26,7 @@ import {
     isSummaryEntry,
     makeSummaryEntry,
     manualRange,
+    normalizeChatEndpoint,
     normalizeSettings,
     parseSummaryEntry,
     pruneSummaryEntries,
@@ -43,6 +44,8 @@ let contextGetter = null;
 let scheduleTimer = null;
 let busy = false;
 let errorCooldownUntil = 0;
+/** 'main' | 'backup'，用于提示本次生成实际使用的通道 */
+let lastGenerationVia = 'main';
 
 /* ---------------------------------- 环境 ---------------------------------- */
 
@@ -404,7 +407,7 @@ function modelText(raw) {
  * @param {string} prompt
  * @returns {Promise<string>}
  */
-async function callModel(prompt) {
+async function callMainApi(prompt) {
     const context = getCtx();
     const failures = [];
 
@@ -473,6 +476,115 @@ async function callModel(prompt) {
     }
 
     throw new Error(`主 API 调用失败（${failures.join('；')}）`);
+}
+
+/* ------------------------------- 备用 API（保底） ------------------------------- */
+
+function getBackupConfig() {
+    const settings = getSettings();
+    return {
+        enabled: Boolean(settings.backupEnabled),
+        endpoint: normalizeChatEndpoint(settings.backupEndpoint),
+        key: String(settings.backupKey ?? '').trim(),
+        model: String(settings.backupModel ?? '').trim(),
+    };
+}
+
+/**
+ * 直接请求 OpenAI 兼容的 /chat/completions。
+ * @param {string} prompt
+ * @returns {Promise<string>}
+ */
+async function callBackupApi(prompt) {
+    const config = getBackupConfig();
+    if (!config.endpoint || !config.key || !config.model) {
+        throw new Error('备用 API 未填写完整（端点 / 密钥 / 模型）');
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 120000);
+
+    try {
+        const response = await fetch(config.endpoint, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${config.key}`,
+            },
+            body: JSON.stringify({
+                model: config.model,
+                messages: [
+                    { role: 'system', content: SYSTEM_PROMPT },
+                    { role: 'user', content: prompt },
+                ],
+                temperature: 0.7,
+                stream: false,
+            }),
+            signal: controller.signal,
+        });
+
+        const rawText = await response.text();
+        let data = null;
+        try {
+            data = rawText ? JSON.parse(rawText) : null;
+        } catch {
+            data = null;
+        }
+
+        if (!response.ok) {
+            const message = data?.error?.message || data?.message || String(rawText).slice(0, 200) || response.statusText;
+            throw new Error(`HTTP ${response.status}：${message}`);
+        }
+
+        const content = data?.choices?.[0]?.message?.content ?? data?.choices?.[0]?.text ?? '';
+        if (!String(content).trim()) {
+            throw new Error('备用 API 返回空内容');
+        }
+
+        console.debug(LOG_PREFIX, '本次总结使用备用 API', config.endpoint);
+        return String(content);
+    } catch (error) {
+        if (error?.name === 'AbortError') {
+            throw new Error('备用 API 超时（120 秒）');
+        }
+        if (error instanceof TypeError) {
+            throw new Error(`备用 API 请求失败（可能是跨域限制或网络问题）：${error.message}`);
+        }
+        throw error;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+/**
+ * 先走主 API；主 API 全部失败且启用了备用 API 时，用备用 API 保底。
+ * @param {string} prompt
+ * @returns {Promise<string>}
+ */
+async function callModel(prompt) {
+    try {
+        const text = await callMainApi(prompt);
+        lastGenerationVia = 'main';
+        return text;
+    } catch (mainError) {
+        const backup = getBackupConfig();
+        if (!backup.enabled) {
+            throw mainError;
+        }
+
+        if (!backup.endpoint || !backup.key || !backup.model) {
+            throw new Error(`${mainError.message}；备用 API 已启用但未填写完整（端点 / 密钥 / 模型）`);
+        }
+
+        notify('info', '主 API 不可用，正在尝试备用 API…');
+        try {
+            const text = await callBackupApi(prompt);
+            lastGenerationVia = 'backup';
+            return text;
+        } catch (backupError) {
+            throw new Error(`${mainError.message}；备用 API 失败（${backupError.message}）`);
+        }
+    }
 }
 
 async function markState(action, endUsed, book) {
@@ -1020,6 +1132,31 @@ function settingsHtml() {
                         <input type="text" id="as_custom_book" class="text_pole" placeholder="自动创建并绑定聊天世界书">
                     </label>
 
+                    <div class="as-backup">
+                        <label class="checkbox_label" for="as_backup_enabled">
+                            <input type="checkbox" id="as_backup_enabled">
+                            <span>备用 API（主 API 失败时保底，默认关闭）</span>
+                        </label>
+                        <label class="as-field" for="as_backup_endpoint">
+                            <span>API 端点</span>
+                            <input type="text" id="as_backup_endpoint" class="text_pole" placeholder="https://api.deepseek.com/v1" autocomplete="off">
+                        </label>
+                        <label class="as-field" for="as_backup_key">
+                            <span>API 密钥</span>
+                            <input type="password" id="as_backup_key" class="text_pole" placeholder="sk-..." autocomplete="new-password">
+                        </label>
+                        <label class="as-field" for="as_backup_model">
+                            <span>模型名</span>
+                            <input type="text" id="as_backup_model" class="text_pole" placeholder="deepseek-chat / gpt-4o-mini" autocomplete="off">
+                        </label>
+                        <div class="as-actions">
+                            <div id="as_test_backup" class="menu_button">测试备用 API</div>
+                        </div>
+                        <small class="as-hint">
+                            端点填到 /v1 或完整的 /chat/completions。密钥保存在酒馆本地设置里，只在你自己的设备上；主 API 完全失败时才会用到它。
+                        </small>
+                    </div>
+
                     <div id="as_status" class="as-status">—</div>
 
                     <div class="as-actions">
@@ -1233,6 +1370,57 @@ function bindSettingsUi() {
         refreshStatus();
     });
 
+    const syncBackupUi = () => {
+        const current = getSettings();
+        $('#as_backup_enabled').prop('checked', current.backupEnabled);
+        $('#as_backup_endpoint').val(current.backupEndpoint).prop('disabled', !current.backupEnabled);
+        $('#as_backup_key').val(current.backupKey).prop('disabled', !current.backupEnabled);
+        $('#as_backup_model').val(current.backupModel).prop('disabled', !current.backupEnabled);
+        $('#as_test_backup').toggleClass('as-disabled', !current.backupEnabled);
+    };
+
+    $('#as_backup_enabled').on('change', function () {
+        const current = getSettings();
+        current.backupEnabled = Boolean(this.checked);
+        persistSettings();
+        syncBackupUi();
+        if (current.backupEnabled && (!current.backupEndpoint || !current.backupKey || !current.backupModel)) {
+            notify('info', '备用 API 已启用，请填写端点、密钥和模型名');
+        }
+    });
+
+    for (const [selector, key] of [['#as_backup_endpoint', 'backupEndpoint'], ['#as_backup_key', 'backupKey'], ['#as_backup_model', 'backupModel']]) {
+        $(selector).on('change blur', function () {
+            const current = getSettings();
+            current[key] = String(this.value ?? '').trim();
+            $(this).val(current[key]);
+            persistSettings();
+        });
+    }
+
+    $('#as_test_backup').on('click', async () => {
+        if (!getSettings().backupEnabled) {
+            notify('info', '请先勾选「备用 API」');
+            return;
+        }
+        if (busy) {
+            notify('info', '正在总结中，请稍候');
+            return;
+        }
+        busy = true;
+        try {
+            const text = await callBackupApi('请只回复两个字：正常');
+            notify('success', `备用 API 正常：${String(text).trim().slice(0, 40) || '（空响应）'}`);
+        } catch (error) {
+            console.error(LOG_PREFIX, '备用 API 测试失败', error);
+            notify('error', `备用 API 测试失败：${error?.message || error}`);
+        } finally {
+            busy = false;
+        }
+    });
+
+    syncBackupUi();
+
     $('#as_manual_small').on('click', () => runManual('small'));
     $('#as_manual_big').on('click', () => runManual('big'));
 
@@ -1244,7 +1432,8 @@ function bindSettingsUi() {
         busy = true;
         try {
             const text = await callModel('请只回复两个字：正常');
-            notify('success', `主 API 正常：${String(text).trim().slice(0, 40) || '（空响应）'}`);
+            const via = lastGenerationVia === 'backup' ? '备用 API' : '主 API';
+            notify('success', `${via} 正常：${String(text).trim().slice(0, 40) || '（空响应）'}`);
         } catch (error) {
             console.error(LOG_PREFIX, '主 API 测试失败', error);
             notify('error', `主 API 测试失败：${error?.message || error}`);

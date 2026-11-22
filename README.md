@@ -92,6 +92,19 @@ SillyTavern/public/scripts/extensions/third-party/st-auto-summary/
 上次：小总结 · 20:15
 ```
 
+## 备用 API（保底）
+
+默认关闭。开启后需要自己填写：
+
+- **API 端点**：OpenAI 兼容地址，填到 `/v1` 或完整的 `/chat/completions` 都可以（例如 `https://api.deepseek.com/v1`）；
+- **API 密钥**：只保存在酒馆本地设置里，不会上传到别处；
+- **模型名**：例如 `deepseek-chat`、`gpt-4o-mini`。
+
+工作方式：先按「酒馆助手 → generateRaw → generateQuietPrompt」走主 API；**三条都失败后**才会用备用 API 重试一次。
+面板上的 **测试备用 API** 会直接请求你填的端点，用来确认地址、密钥、模型是否可用。
+
+注意：备用 API 是浏览器直接请求，端点需要允许跨域（OpenAI、DeepSeek、OpenRouter 等都支持）；如果提示跨域失败，换一个允许 CORS 的端点。
+
 ## 生成与成本
 
 - 使用酒馆**当前正在使用的主 API** 生成，不会在聊天里留下消息，调用顺序为：
@@ -102,7 +115,7 @@ SillyTavern/public/scripts/extensions/third-party/st-auto-summary/
 - 每次最多把 `maxInputChars`（默认 8000 字符）的聊天内容喂给模型，超长消息会逐条截断，优先保留较新的内容；
 - 提示词要求：小总结 250 字以内；大总结按覆盖楼层给上限（见下表），并按剧情重要度在上限内伸缩；
 - 首次开启大总结且历史很长时，受输入上限影响只能保留最近部分；可以调高 `maxInputChars`，或先用小总结/手动大总结分段补齐；
-- 失败会提示原因，并进入 60 秒冷却。
+- 失败会提示原因（主 API 三条路径 + 备用 API 的错误会一起显示），并进入 60 秒冷却。
 
 ## 大总结字数上限
 

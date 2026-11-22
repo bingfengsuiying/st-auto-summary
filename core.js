@@ -32,6 +32,11 @@ export const DEFAULT_SETTINGS = {
     customBook: '',
     /** 单次总结最多喂给模型多少字符 */
     maxInputChars: 8000,
+    /** 备用 API：主 API 失败时保底，默认关闭 */
+    backupEnabled: false,
+    backupEndpoint: '',
+    backupKey: '',
+    backupModel: '',
 };
 
 function toInt(value, fallback) {
@@ -66,6 +71,10 @@ export function normalizeSettings(raw = {}) {
     settings.maxInputChars = clampInt(settings.maxInputChars, 1000, 60000, DEFAULT_SETTINGS.maxInputChars);
     settings.injectMode = settings.injectMode === 'before' ? 'before' : 'depth';
     settings.customBook = String(settings.customBook ?? '').trim();
+    settings.backupEnabled = Boolean(settings.backupEnabled);
+    settings.backupEndpoint = String(settings.backupEndpoint ?? '').trim();
+    settings.backupKey = String(settings.backupKey ?? '').trim();
+    settings.backupModel = String(settings.backupModel ?? '').trim();
 
     return settings;
 }
@@ -536,6 +545,28 @@ export function getFreeUid(entries) {
         }
     }
     return null;
+}
+
+/**
+ * 把用户填的端点补成 OpenAI 兼容的 /chat/completions 地址。
+ * - 已经以 /chat/completions 结尾：原样使用
+ * - 以 /v1 结尾：补 /chat/completions
+ * - 其它：补 /v1/chat/completions
+ * @param {string} input
+ */
+export function normalizeChatEndpoint(input) {
+    let url = String(input ?? '').trim();
+    if (!url) {
+        return '';
+    }
+    url = url.replace(/\/+$/, '');
+    if (/\/chat\/completions$/i.test(url)) {
+        return url;
+    }
+    if (/\/v1$/i.test(url)) {
+        return `${url}/chat/completions`;
+    }
+    return `${url}/v1/chat/completions`;
 }
 
 /* ---------------------------------- 命名 ---------------------------------- */

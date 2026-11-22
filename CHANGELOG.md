@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.4.0
+
+- 总结改为明确使用酒馆当前正在使用的主 API：
+  - 优先「酒馆助手」(TavernHelper) 的 generateRaw
+  - 回退酒馆自带 generateRaw（不再传 responseLength）
+  - 再回退 generateQuietPrompt
+- 兼容接口返回字符串 / {content} / {text}
+- 新增「测试主 API」按钮，失败时显示三条路径的具体原因
+
 ## 1.3.0
 
 - 大总结不再“只写大概剧情”，改为按覆盖楼层动态给字数上限：

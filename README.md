@@ -94,7 +94,11 @@ SillyTavern/public/scripts/extensions/third-party/st-auto-summary/
 
 ## 生成与成本
 
-- 使用当前接口的 `generateRaw` 静默生成，不会在聊天里留下消息；
+- 使用酒馆**当前正在使用的主 API** 生成，不会在聊天里留下消息，调用顺序为：
+  1. 装了「酒馆助手」(TavernHelper) 时用它的 `generateRaw`；
+  2. 否则用酒馆自带的 `generateRaw`（不传 `responseLength`，避免部分接口因 max_tokens 报错）；
+  3. 再退一步用 `generateQuietPrompt`；
+- 面板上的 **测试主 API** 按钮会发一条极短请求，直接告诉你当前接口是否可用、走到哪一步；
 - 每次最多把 `maxInputChars`（默认 8000 字符）的聊天内容喂给模型，超长消息会逐条截断，优先保留较新的内容；
 - 提示词要求：小总结 250 字以内；大总结按覆盖楼层给上限（见下表），并按剧情重要度在上限内伸缩；
 - 首次开启大总结且历史很长时，受输入上限影响只能保留最近部分；可以调高 `maxInputChars`，或先用小总结/手动大总结分段补齐；
@@ -122,8 +126,11 @@ SillyTavern/public/scripts/extensions/third-party/st-auto-summary/
 
 ## 排障
 
-**提示 Authorization Required / API returned an error**
-接口密钥或模型配置有问题，先在酒馆里正常发一条消息确认能生成。
+**提示 Authorization Required / API returned an error / 主 API 调用失败**
+先点面板上的 **测试主 API**：
+- 提示成功 → 接口没问题，检查总结的输入是否过长或模型是否拒绝；
+- 提示失败 → 按括号里的原因排查（酒馆助手 / generateRaw / generateQuietPrompt 三条路径会一起显示）；
+先在酒馆里正常发一条消息，确认当前接口和模型本身可用。
 
 **点了没反应 / 提示“当前聊天还没有保存”**
 新聊天需要先有一条消息并落盘；或者先在设置里指定一本世界书。

@@ -1,5 +1,5 @@
 /**
- * 剧情自动总结 / Auto Summary  v1.3
+ * 剧情自动总结 / Auto Summary  v1.4
  *
  * 每 N 条聊天做一次小总结，每 M 条做一次大总结，并写入当前聊天绑定的世界书，
  * 作为常驻条目辅助后续生成。
@@ -380,22 +380,99 @@ function isGenerating() {
     return document.body?.dataset?.generating === 'true';
 }
 
-async function callModel(prompt, kind, maxChars = 0) {
+/**
+ * 兼容不同接口返回的字符串 / {content} / {text}。
+ */
+function modelText(raw) {
+    if (typeof raw === 'string') {
+        return raw;
+    }
+    if (raw && typeof raw === 'object') {
+        return String(raw.content ?? raw.text ?? '');
+    }
+    return raw == null ? '' : String(raw);
+}
+
+/**
+ * 用酒馆当前正在使用的主 API 生成文本。
+ *
+ * 参考记忆表格插件的做法：
+ * 1. 装了「酒馆助手」(TavernHelper) 时优先用它的 generateRaw（流式体验最好）；
+ * 2. 否则用酒馆自带的 generateRaw（不传 responseLength，避免部分接口因 max_tokens 报错）；
+ * 3. 再退一步用 generateQuietPrompt（同样是主 API）。
+ *
+ * @param {string} prompt
+ * @returns {Promise<string>}
+ */
+async function callModel(prompt) {
     const context = getCtx();
-    if (typeof context?.generateRaw !== 'function') {
-        throw new Error('当前酒馆版本不支持静默生成，请升级到 1.13 以上');
+    const failures = [];
+
+    const helper = globalThis.TavernHelper;
+    if (helper && typeof helper.generateRaw === 'function') {
+        try {
+            const raw = await helper.generateRaw({
+                ordered_prompts: [
+                    { role: 'system', content: SYSTEM_PROMPT },
+                    { role: 'user', content: prompt },
+                ],
+                should_stream: false,
+            });
+            const text = modelText(raw);
+            if (text.trim()) {
+                console.debug(LOG_PREFIX, '本次总结使用 TavernHelper.generateRaw');
+                return text;
+            }
+            failures.push('酒馆助手返回空内容');
+        } catch (error) {
+            console.warn(LOG_PREFIX, 'TavernHelper.generateRaw 失败', error);
+            failures.push(`酒馆助手：${error?.message || error}`);
+        }
     }
 
-    const bigTokens = Math.max(600, Math.min(4096, Math.round((maxChars || 800) * 1.15)));
+    if (typeof context?.generateRaw === 'function') {
+        try {
+            const raw = await context.generateRaw({
+                prompt,
+                systemPrompt: SYSTEM_PROMPT,
+                trimNames: false,
+            });
+            const text = modelText(raw);
+            if (text.trim()) {
+                console.debug(LOG_PREFIX, '本次总结使用 generateRaw');
+                return text;
+            }
+            failures.push('generateRaw 返回空内容');
+        } catch (error) {
+            console.warn(LOG_PREFIX, 'generateRaw 失败', error);
+            failures.push(`generateRaw：${error?.message || error}`);
+        }
+    }
 
-    const raw = await context.generateRaw({
-        prompt,
-        systemPrompt: SYSTEM_PROMPT,
-        responseLength: kind === 'big' ? bigTokens : 500,
-        trimNames: false,
-    });
+    if (typeof context?.generateQuietPrompt === 'function') {
+        try {
+            const raw = await context.generateQuietPrompt({
+                quietPrompt: `${SYSTEM_PROMPT}\n\n${prompt}`,
+                quietToLoud: false,
+                skipWIAN: true,
+            });
+            const text = modelText(raw);
+            if (text.trim()) {
+                console.debug(LOG_PREFIX, '本次总结使用 generateQuietPrompt');
+                return text;
+            }
+            failures.push('generateQuietPrompt 返回空内容');
+        } catch (error) {
+            console.warn(LOG_PREFIX, 'generateQuietPrompt 失败', error);
+            failures.push(`generateQuietPrompt：${error?.message || error}`);
+        }
+    }
 
-    return String(raw ?? '');
+    if (failures.length === 0) {
+        throw new Error('当前酒馆没有可用的主 API 调用方式，请确认已配置好模型接口');
+    }
+
+    throw new Error(`主 API 调用失败（${failures.join('；')}）`);
 }
 
 async function markState(action, endUsed, book) {
@@ -449,7 +526,7 @@ async function generateForRange(action, { includePrevious = false } = {}) {
         ? buildBigPrompt({ start: transcriptStart, end: action.end, transcript: transcript.text, previous, maxChars: bigLimit })
         : buildSmallPrompt({ start: action.start, end: action.end, transcript: transcript.text });
 
-    const raw = await callModel(prompt, action.kind, bigLimit);
+    const raw = await callModel(prompt);
     const content = cleanSummary(raw, action.kind === 'big' ? bigLimit : 500);
     if (!content) {
         throw new Error('模型没有返回有效内容');
@@ -950,6 +1027,7 @@ function settingsHtml() {
                         <div id="as_manual_big" class="menu_button">立即大总结</div>
                     </div>
                     <div class="as-actions">
+                        <div id="as_test_api" class="menu_button">测试主 API</div>
                         <div id="as_clear" class="menu_button">清理总结条目</div>
                     </div>
 
@@ -1157,6 +1235,23 @@ function bindSettingsUi() {
 
     $('#as_manual_small').on('click', () => runManual('small'));
     $('#as_manual_big').on('click', () => runManual('big'));
+
+    $('#as_test_api').on('click', async () => {
+        if (busy) {
+            notify('info', '正在总结中，请稍候');
+            return;
+        }
+        busy = true;
+        try {
+            const text = await callModel('请只回复两个字：正常');
+            notify('success', `主 API 正常：${String(text).trim().slice(0, 40) || '（空响应）'}`);
+        } catch (error) {
+            console.error(LOG_PREFIX, '主 API 测试失败', error);
+            notify('error', `主 API 测试失败：${error?.message || error}`);
+        } finally {
+            busy = false;
+        }
+    });
     $('#as_clear').on('click', () => {
         clearSummaries().catch((error) => {
             console.error(LOG_PREFIX, error);
